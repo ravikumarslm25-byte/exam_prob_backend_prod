@@ -1,0 +1,598 @@
+import { Router } from 'express';
+import { z } from 'zod';
+import { Exam, Room, Attempt } from '../models/exam.js';
+import { Institution } from '../models/core.js';
+import { authenticate, can, tenant } from '../middleware/auth.js';
+import { audit } from '../middleware/audit.js';
+import { wrap, notFound, forbidden, badRequest } from '../utils/http.js';
+import { parse } from '../utils/validate.js';
+import { storage } from '../services/storage.js';
+import { VIOLATION_CATALOGUE } from '../utils/grading.js';
+import { pushToCandidate, pushToRoom } from '../realtime/live.js';
+import { recomputeWritingUntil } from '../services/closeExam.js';
+import { applyResume } from '../services/resume.js';
+import { gradeObjective } from '../services/finalise.js';
+import { examStartAt } from '../utils/time.js';
+import { syncExamStatuses } from '../utils/examStatus.js';
+
+const r = Router();
+r.use(authenticate);
+
+const now = () => new Date();
+
+/* An invigilator sees only the rooms allocated to them. Examination
+   administration sees every room. */
+async function roomsForActor(req) {
+  const wide = req.actor.permissions.has('exam:publish')
+    || req.actor.permissions.has('schedule:publish')
+    || req.actor.scope === 'institution';
+
+  const filter = { ...tenant(req) };
+  if (!wide) filter.invigilatorId = req.actor.id;
+  return { filter, wide };
+}
+
+/* ============================================================
+   MY ROOMS
+   ============================================================ */
+r.get('/rooms', can('invigilation:view'), wrap(async (req, res) => {
+  const { filter, wide } = await roomsForActor(req);
+
+  const rooms = await Room.find(filter)
+    /* Every field `dueStatus` and the sweep read. Without
+       `writingUntil` the invigilator's own page decided a paper with
+       an outstanding extension was over AND WROTE THAT BACK — and
+       'evaluation' is workflow-driven, so nothing could put it
+       right. Without `blueprint` the sweep threw on every attempt and
+       sealed nothing. */
+    .populate('examId', 'title code date startTime durationMinutes status timezone startsAt passMark'
+      + ' blueprint writingUntil lastSittingEndsAt closedAt')
+    .populate('invigilatorId', 'name')
+    .sort({ startAt: -1 }).limit(120).lean();
+
+  /* Statuses are advanced before anything is classified, or a paper
+     whose window has passed still counts as live and keeps offering
+     an invigilator a wall of candidates who went home. */
+  const institution = await Institution.findById(req.actor.institutionId).lean();
+  const exams = [...new Map(rooms.filter((x) => x.examId)
+    .map((x) => [String(x.examId._id), x.examId])).values()];
+  await syncExamStatuses(Exam, exams, institution);
+
+  /* Three groups an invigilator understands: what is being sat now,
+     what is about to be, and what is over and only reviewable. */
+  const phaseOf = (exam) => {
+    if (!exam) return 'past';
+    if (exam.status === 'live') return 'live';
+    if (exam.status === 'scheduled') return 'upcoming';
+    return 'past';
+  };
+  for (const x of rooms) x.phase = phaseOf(x.examId);
+
+  const live = rooms.filter((x) => x.phase === 'live');
+
+  const counts = await Attempt.aggregate([
+    { $match: { roomId: { $in: rooms.map((x) => x._id) } } },
+    { $group: {
+      _id: '$roomId',
+      total: { $sum: 1 },
+      present: { $sum: { $cond: [{ $in: ['$status', ['in_progress', 'submitted', 'flagged']] }, 1, 0] } },
+      submitted: { $sum: { $cond: [{ $eq: ['$status', 'submitted'] }, 1, 0] } },
+      flagged: { $sum: { $cond: [{ $gt: ['$flagScore', 0] }, 1, 0] } },
+    } },
+  ]);
+  const byRoom = Object.fromEntries(counts.map((c) => [String(c._id), c]));
+
+  res.json({
+    scopedToMe: !wide,
+    rooms: rooms.map((x) => ({
+      id: String(x._id),
+      name: x.name,
+      startAt: x.startAt, endAt: x.endAt,
+      invigilator: x.invigilatorId ? { id: String(x.invigilatorId._id), name: x.invigilatorId.name } : null,
+      phase: x.phase,
+      exam: x.examId ? {
+        id: String(x.examId._id), title: x.examId.title, code: x.examId.code,
+        date: x.examId.date, startTime: x.examId.startTime,
+        durationMinutes: x.examId.durationMinutes, status: x.examId.status,
+        startsAt: examStartAt(x.examId),
+      } : null,
+      stats: byRoom[String(x._id)] || { total: 0, present: 0, submitted: 0, flagged: 0 },
+    })),
+    liveCount: live.length,
+  });
+}));
+
+/* ============================================================
+   WALL
+   One query returns every tile. Frames come from the interval
+   captures the candidate is already uploading, so the wall needs
+   no separate media path.
+   ============================================================ */
+r.get('/rooms/:roomId/wall', can('invigilation:view'), wrap(async (req, res) => {
+  const { filter } = await roomsForActor(req);
+  const room = await Room.findOne({ _id: req.params.roomId, ...filter })
+    .populate('examId')
+    .lean();
+  if (!room) throw notFound('Room not found, or it is not allocated to you');
+
+  const attempts = await Attempt.find({ roomId: room._id, ...tenant(req) })
+    .populate('studentId', 'name regNo')
+    .lean();
+
+  const exam = room.examId;
+  const ceiling = exam?.proctoring?.flagCeiling ?? 3;
+  const stale = 45000;   // no heartbeat for 45s reads as disconnected
+
+  const tiles = await Promise.all(attempts.map(async (a) => {
+    const openScan = (a.scanWindows || []).find((w) => !w.closedAt);
+    const seen = a.lastSeenAt ? now() - new Date(a.lastSeenAt) : null;
+
+    let state = 'not_started';
+    if (a.status === 'submitted') state = 'submitted';
+    else if (a.status === 'terminated') state = 'terminated';
+    else if (a.status === 'in_progress') {
+      if (seen !== null && seen > stale) state = 'disconnected';
+      else if (openScan) state = 'scanning';
+      else if (a.flagScore > 0) state = 'flagged';
+      else state = 'ok';
+    } else if (a.status === 'verifying') state = 'verifying';
+
+    const answered = (a.answers || []).filter((x) =>
+      x.selected?.length || (x.text || '').trim() || (x.html || '').trim() || x.scanPages?.length).length;
+
+    return {
+      attemptId: String(a._id),
+      student: a.studentId ? { name: a.studentId.name, regNo: a.studentId.regNo } : null,
+      status: a.status,
+      /* Someone sitting at 14:00 when the hall emptied at 12:00 looks
+         like a fault on the wall unless the wall says otherwise. */
+      sitting: a.sitting?.startsAt
+        ? {
+          startsAt: a.sitting.startsAt,
+          endsAt: new Date(new Date(a.sitting.startsAt).getTime()
+            + (a.sitting.durationMinutes || a.examId?.durationMinutes || 0) * 60000),
+          reason: a.sitting.reason,
+        }
+        : null,
+      state,
+      flagScore: a.flagScore || 0,
+      ceiling,
+      answered,
+      section: a.sectionState?.current || 'A',
+      lastSeenAt: a.lastSeenAt,
+      frameUrl: a.latestFrame?.key ? await storage.urlFor(a.latestFrame.key) : null,
+      frameAt: a.latestFrame?.at || null,
+      unreadFromStudent: (a.chat || []).filter((c) => c.from === 'student').length,
+      latestViolation: (a.violations || []).length
+        ? (() => {
+            const v = a.violations[a.violations.length - 1];
+            return { label: VIOLATION_CATALOGUE[v.type]?.label || v.type, severity: v.severity, at: v.at };
+          })()
+        : null,
+    };
+  }));
+
+  // flagged first, then disconnected — the invigilator should never
+  // have to scan a grid to find the candidate who needs attention
+  const rank = { flagged: 0, disconnected: 1, scanning: 2, verifying: 3, ok: 4, submitted: 5, terminated: 6, not_started: 7 };
+  tiles.sort((a, b) => (rank[a.state] - rank[b.state]) || b.flagScore - a.flagScore);
+
+  const startAt = exam ? examStartAt(exam) : null;
+
+  res.json({
+    room: { id: String(room._id), name: room.name, capacity: room.capacity },
+    exam: exam ? {
+      id: String(exam._id), title: exam.title, code: exam.code,
+      status: exam.status, durationMinutes: exam.durationMinutes,
+      startAt,
+      elapsedMinutes: startAt ? Math.max(0, Math.floor((now() - startAt) / 60000)) : 0,
+    } : null,
+    summary: {
+      total: tiles.length,
+      present: tiles.filter((t) => ['ok', 'flagged', 'scanning', 'submitted'].includes(t.state)).length,
+      submitted: tiles.filter((t) => t.state === 'submitted').length,
+      flagged: tiles.filter((t) => t.flagScore > 0).length,
+      scanning: tiles.filter((t) => t.state === 'scanning').length,
+      disconnected: tiles.filter((t) => t.state === 'disconnected').length,
+      terminated: tiles.filter((t) => t.state === 'terminated').length,
+    },
+    tiles,
+    serverTime: now(),
+  });
+}));
+
+/* ============================================================
+   FOCUS — one candidate in detail
+   ============================================================ */
+r.get('/attempts/:id', can('invigilation:view'), wrap(async (req, res) => {
+  const attempt = await Attempt.findOne({ _id: req.params.id, ...tenant(req) })
+    .populate('studentId', 'name regNo email photoKey')
+    .populate('examId', 'title code proctoring durationMinutes')
+    .populate('roomId', 'name invigilatorId')
+    .lean();
+  if (!attempt) throw notFound('Attempt not found');
+
+  const wide = req.actor.permissions.has('exam:publish') || req.actor.scope === 'institution';
+  if (!wide && String(attempt.roomId?.invigilatorId) !== req.actor.id) {
+    throw forbidden('That candidate is not in a room allocated to you');
+  }
+
+  const url = async (k) => (k ? storage.urlFor(k) : null);
+
+  res.json({
+    attempt: {
+      id: String(attempt._id),
+      status: attempt.status,
+      student: attempt.studentId,
+      exam: attempt.examId,
+      room: attempt.roomId ? { name: attempt.roomId.name } : null,
+      sitting: attempt.sitting?.startsAt
+        ? {
+          startsAt: attempt.sitting.startsAt,
+          endsAt: new Date(new Date(attempt.sitting.startsAt).getTime()
+            + (attempt.sitting.durationMinutes || attempt.examId?.durationMinutes || 0) * 60000),
+          reason: attempt.sitting.reason,
+        }
+        : null,
+      startedAt: attempt.startedAt,
+      timerEndsAt: attempt.timerEndsAt,
+      flagScore: attempt.flagScore,
+      ceiling: attempt.examId?.proctoring?.flagCeiling ?? 3,
+      section: attempt.sectionState?.current,
+      lockedSections: attempt.sectionState?.lockedSections || [],
+      lastSeenAt: attempt.lastSeenAt,
+      environment: attempt.environment,
+      micGranted: Boolean(attempt.micGrantedUntil && new Date(attempt.micGrantedUntil) > now()),
+      timeExtension: attempt.timeExtension,
+      terminationReason: attempt.terminationReason,
+    },
+    identity: {
+      faceUrl: await url(attempt.identity?.faceKey),
+      idCardUrl: await url(attempt.identity?.idCardKey),
+      verifiedAt: attempt.identity?.verifiedAt,
+    },
+    latestFrameUrl: await url(attempt.latestFrame?.key),
+    violations: await Promise.all((attempt.violations || []).map(async (v) => ({
+      type: v.type,
+      label: VIOLATION_CATALOGUE[v.type]?.label || v.type,
+      severity: v.severity, weight: v.weight, at: v.at, note: v.note,
+      cameraUrl: await url(v.cameraKey),
+      screenUrl: await url(v.screenKey),
+    }))),
+    chat: (attempt.chat || []).map((c) => ({ from: c.from, body: c.body, at: c.at })),
+    warnings: (attempt.warnings || []).map((w) => ({
+      body: w.body, byName: w.byName, at: w.at, acknowledgedAt: w.acknowledgedAt,
+    })),
+    scanWindows: attempt.scanWindows || [],
+  });
+}));
+
+/* ============================================================
+   CAPTURE TIMELINE
+   Evidence was being written to storage with nothing recording where
+   it went. This is what makes an attempt reviewable afterwards.
+   ============================================================ */
+r.get('/attempts/:id/captures', can('invigilation:view', 'evaluation:view'), wrap(async (req, res) => {
+  const attempt = await Attempt.findOne({ _id: req.params.id, ...tenant(req) })
+    .populate('studentId', 'name regNo')
+    .populate('roomId', 'name invigilatorId')
+    .lean();
+  if (!attempt) throw notFound('Attempt not found');
+
+  const wide = req.actor.permissions.has('exam:publish')
+    || req.actor.permissions.has('evaluation:view')
+    || req.actor.scope === 'institution';
+  if (!wide && String(attempt.roomId?.invigilatorId) !== req.actor.id) {
+    throw forbidden('That candidate is not in a room allocated to you');
+  }
+
+  const onlyFlagged = req.query.flagged === 'true';
+  const page = Math.max(1, Number(req.query.page) || 1);
+  const size = Math.min(120, Number(req.query.size) || 60);
+
+  let all = [...(attempt.captures || [])].sort((a, b) => new Date(a.at) - new Date(b.at));
+  if (onlyFlagged) all = all.filter((c) => c.flagged);
+
+  const slice = all.slice((page - 1) * size, page * size);
+
+  res.json({
+    student: attempt.studentId,
+    room: attempt.roomId ? { name: attempt.roomId.name } : null,
+    startedAt: attempt.startedAt,
+    submittedAt: attempt.submittedAt,
+    total: all.length,
+    flaggedTotal: (attempt.captures || []).filter((c) => c.flagged).length,
+    page, size,
+    captures: await Promise.all(slice.map(async (c) => ({
+      at: c.at,
+      kind: c.kind,
+      flagged: c.flagged,
+      violation: c.violationType ? (VIOLATION_CATALOGUE[c.violationType]?.label || c.violationType) : null,
+      url: await storage.urlFor(c.key),
+      // seconds from the start of the attempt, for the timeline scrubber
+      offset: attempt.startedAt
+        ? Math.max(0, Math.round((new Date(c.at) - new Date(attempt.startedAt)) / 1000))
+        : null,
+    }))),
+  });
+}));
+
+/* ============================================================
+   CONTROLS
+   ============================================================ */
+async function loadForControl(req) {
+  const attempt = await Attempt.findOne({ _id: req.params.id, ...tenant(req) })
+    .populate('roomId', 'invigilatorId');
+  if (!attempt) throw notFound('Attempt not found');
+
+  const wide = req.actor.permissions.has('exam:publish') || req.actor.scope === 'institution';
+  if (!wide && String(attempt.roomId?.invigilatorId) !== req.actor.id) {
+    throw forbidden('That candidate is not in a room allocated to you');
+  }
+  return attempt;
+}
+
+r.post('/attempts/:id/message', can('invigilation:edit'), wrap(async (req, res) => {
+  const attempt = await loadForControl(req);
+  const { body } = parse(z.object({ body: z.string().min(1).max(600) }), req.body);
+
+  const at = now();
+
+  /* Written BEFORE it is delivered. Pushing first meant the candidate
+     could have the message on screen while the save behind it failed
+     — the heartbeat saves this same document every few seconds, so a
+     version conflict here is ordinary — leaving a message the
+     candidate saw, the transcript never recorded, and the invigilator
+     was never told about.
+
+     `$push` rather than save(), for the same reason: it is atomic
+     against the heartbeat instead of racing it. */
+  await Attempt.updateOne(
+    { _id: attempt._id, ...tenant(req) },
+    { $push: { chat: { from: 'invigilator', body, at, readByStudent: false } } },
+  );
+
+  const delivered = pushToCandidate(attempt._id, { type: 'chat', from: 'invigilator', body, at });
+
+  /* Marked read only once the socket has actually taken it, so an
+     undelivered message still rides the heartbeat and a delivered one
+     is never sent twice. */
+  if (delivered) {
+    await Attempt.updateOne(
+      { _id: attempt._id, ...tenant(req) },
+      { $set: { 'chat.$[m].readByStudent': true } },
+      { arrayFilters: [{ 'm.at': at, 'm.from': 'invigilator' }] },
+    );
+  }
+
+  /* The other proctors on the room see it too, including the sender,
+     whose own panel shows it the moment it is sent. This used to come
+     from a second socket relay that also hit the candidate — which is
+     what made every message appear twice on their screen. */
+  if (attempt.roomId) {
+    pushToRoom(attempt.roomId._id || attempt.roomId, {
+      type: 'chat', attemptId: String(attempt._id), from: 'invigilator', body, at,
+    });
+  }
+
+  res.json({ ok: true, delivered });
+}));
+
+/* A warning blocks the candidate's screen until acknowledged, so it
+   is recorded rather than merely sent. */
+r.post('/attempts/:id/warn', can('invigilation:edit'), wrap(async (req, res) => {
+  const attempt = await loadForControl(req);
+  const { body } = parse(z.object({ body: z.string().min(1).max(600) }), req.body);
+
+  attempt.warnings.push({ by: req.actor.id, byName: req.actor.name, body, at: now() });
+  await attempt.save();
+
+  pushToCandidate(attempt._id, { type: 'warning', body, by: req.actor.name });
+
+  await audit(req, { action: 'invigilation.warned', entity: 'Attempt', entityId: attempt._id, after: { body } });
+  res.json({ ok: true, warnings: attempt.warnings.length });
+}));
+
+r.post('/attempts/:id/mic', can('invigilation:edit'), wrap(async (req, res) => {
+  const attempt = await loadForControl(req);
+  const { minutes } = parse(z.object({
+    minutes: z.number().int().min(0).max(15).default(2),
+  }), req.body);
+
+  attempt.micGrantedUntil = minutes > 0 ? new Date(now().getTime() + minutes * 60000) : null;
+  await attempt.save();
+
+  pushToCandidate(attempt._id, {
+    type: 'mic',
+    granted: minutes > 0,
+    until: attempt.micGrantedUntil,
+    by: req.actor.name,
+  });
+
+  await audit(req, {
+    action: minutes > 0 ? 'invigilation.mic_granted' : 'invigilation.mic_revoked',
+    entity: 'Attempt', entityId: attempt._id, after: { minutes },
+  });
+  res.json({ ok: true, micGrantedUntil: attempt.micGrantedUntil });
+}));
+
+/* Disqualification requires a stated reason. It is preserved in full
+   so the Controller can answer an appeal. */
+r.post('/attempts/:id/terminate', can('invigilation:edit'), wrap(async (req, res) => {
+  const attempt = await loadForControl(req);
+  const { reason } = parse(z.object({
+    reason: z.string().min(10, 'State the reason in at least a short sentence').max(1000),
+  }), req.body);
+
+  if (['submitted', 'terminated'].includes(attempt.status)) {
+    throw badRequest('This attempt is already closed');
+  }
+
+  attempt.status = 'terminated';
+  attempt.terminationReason = `${reason} — ${req.actor.name}`;
+  attempt.submittedAt = now();
+
+  /* Graded on the way out, exactly as the automatic disqualification
+     at the flag ceiling already does. Without this the script sat in
+     the queue with nothing marked and a total of zero, which blocked
+     publishing the whole paper until someone forced it — and an
+     appeal had no record of what the candidate had actually got
+     right. `decidePass` keeps a disqualification off the pass list
+     whatever the marks come to. */
+  const exam = await Exam.findById(attempt.examId);
+  if (exam) await gradeObjective(attempt, exam);
+
+  await attempt.save();
+
+  pushToCandidate(attempt._id, { type: 'terminated', reason: attempt.terminationReason });
+
+  await audit(req, {
+    action: 'invigilation.terminated', entity: 'Attempt', entityId: attempt._id,
+    after: { reason, flagScore: attempt.flagScore },
+  });
+  res.json({ ok: true, status: attempt.status });
+}));
+
+r.post('/attempts/:id/extend', can('invigilation:edit'), wrap(async (req, res) => {
+  const attempt = await loadForControl(req);
+  const { minutes, reason } = parse(z.object({
+    minutes: z.number().int().min(1).max(120),
+    reason: z.string().min(5, 'State why the extension is granted').max(500),
+  }), req.body);
+
+  if (attempt.status !== 'in_progress') throw badRequest('This candidate is not sitting the paper');
+
+  attempt.timerEndsAt = new Date(new Date(attempt.timerEndsAt).getTime() + minutes * 60000);
+  attempt.timeExtension = { minutes, reason, approvedBy: req.actor.id, at: now() };
+  await attempt.save();
+
+  /* The paper has to know someone is still writing past its own end,
+     or its status flips to evaluation underneath them and it drops
+     off the invigilator's wall while they are being proctored. */
+  const exam = await Exam.findById(attempt.examId);
+  if (exam) {
+    await recomputeWritingUntil(exam);
+    await exam.save();
+  }
+
+  await audit(req, {
+    action: 'invigilation.time_extended', entity: 'Attempt', entityId: attempt._id,
+    after: { minutes, reason },
+  });
+  res.json({ ok: true, timerEndsAt: attempt.timerEndsAt });
+}));
+
+/* ============================================================
+   LETTING A CANDIDATE BACK IN
+
+   A machine dies, the power goes, the network drops. The invigilator
+   confirms what happened and readmits the candidate — but not to the
+   paper they left.
+
+   What they had answered is sealed and cannot be rewritten. What they
+   had not is replaced, question for question, with a different
+   question of the same part, type and marks from the approved bank.
+   A candidate who disconnected honestly loses none of their work; a
+   candidate who disconnected to buy a second look at a hard question
+   comes back to one they have never seen.
+
+   The invigilator is told exactly what the system did, because they
+   are the person the candidate will ask.
+   ============================================================ */
+r.post('/attempts/:id/resume', can('invigilation:edit'), wrap(async (req, res) => {
+  const attempt = await loadForControl(req);
+  const { extraMinutes, reason } = parse(z.object({
+    extraMinutes: z.number().int().min(0).max(120),
+    reason: z.string().min(5, 'State what happened and why the candidate is being readmitted').max(500),
+  }), req.body);
+
+  if (attempt.status === 'submitted') {
+    throw badRequest('This paper has already been submitted and cannot be reopened.');
+  }
+  if (attempt.status === 'terminated') {
+    throw badRequest('This candidate was disqualified. Reopening a disqualified paper is not a resume.');
+  }
+  if (!attempt.startedAt) {
+    throw badRequest('This candidate never started the paper, so there is nothing to resume.');
+  }
+
+  const exam = await Exam.findById(attempt.examId);
+  if (!exam) throw notFound('That examination could not be found');
+
+  const out = await applyResume({
+    attempt,
+    exam,
+    approver: { id: req.actor.id, name: req.actor.name },
+    reason,
+    extraMinutes,
+    /* Picked at random from the interchangeable questions rather than
+       taking the first, so two candidates resumed in the same hall do
+       not receive the same replacement paper. */
+    pick: (options) => options[Math.floor(Math.random() * options.length)],
+  });
+
+  /* The paper has to know someone is writing past its own end, or its
+     status flips to evaluation underneath them. */
+  await recomputeWritingUntil(exam);
+  await exam.save();
+
+  await audit(req, {
+    action: 'invigilation.resumed', entity: 'Attempt', entityId: attempt._id,
+    after: {
+      reason, extraMinutes,
+      sealed: out.sealed, swapped: out.swapped,
+      unswappable: out.unswappable.length,
+    },
+  });
+
+  res.json({
+    ok: true,
+    sealed: out.sealed,
+    swapped: out.swapped,
+    unswappable: out.unswappable,
+    timerEndsAt: out.timerEndsAt,
+    message: `${out.sealed} answered question(s) sealed, ${out.swapped} unanswered question(s) replaced`
+      + `${out.unswappable.length ? `, ${out.unswappable.length} could not be replaced` : ''}.`,
+  });
+}));
+
+/* Room broadcast. One message to every candidate still working. */
+r.post('/rooms/:roomId/broadcast', can('invigilation:edit'), wrap(async (req, res) => {
+  const { filter } = await roomsForActor(req);
+  const room = await Room.findOne({ _id: req.params.roomId, ...filter }).lean();
+  if (!room) throw notFound('Room not found, or it is not allocated to you');
+
+  const { body } = parse(z.object({ body: z.string().min(1).max(600) }), req.body);
+
+  const live = await Attempt.find({ roomId: room._id, status: 'in_progress' }).select('_id').lean();
+  const at = now();
+
+  /* Marked read only for the candidates whose socket actually took
+     it. Writing `readByStudent: true` for everyone meant a candidate
+     whose connection was down — the one person who most needed
+     "fifteen minutes remaining" — had it recorded as delivered, and
+     the heartbeat, which only resends unread messages, never brought
+     it to them. */
+  const got = [];
+  const missed = [];
+  for (const a of live) {
+    (pushToCandidate(a._id, { type: 'chat', from: 'invigilator', body, at }) ? got : missed)
+      .push(a._id);
+  }
+
+  for (const [ids, read] of [[got, true], [missed, false]]) {
+    if (!ids.length) continue;
+    await Attempt.updateMany(
+      { _id: { $in: ids } },
+      { $push: { chat: { from: 'invigilator', body, at, readByStudent: read } } },
+    );
+  }
+  const result = { modifiedCount: live.length };
+
+  await audit(req, { action: 'invigilation.broadcast', entity: 'Room', entityId: room._id,
+    after: { body, onScreenNow: got.length, waitingForReconnect: missed.length } });
+  res.json({ ok: true, delivered: result.modifiedCount,
+             onScreenNow: got.length, waitingForReconnect: missed.length });
+}));
+
+export default r;
