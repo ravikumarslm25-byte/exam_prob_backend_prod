@@ -123,6 +123,46 @@ export const VIOLATION_CATALOGUE = {
   no_face:            { severity: 'high',     label: 'Face not visible' },
   multiple_faces:     { severity: 'critical', label: 'Multiple faces detected' },
   looking_away:       { severity: 'medium',   label: 'Looking away' },
+  /* The head stayed forward and the eyes did not. This is the one
+     that catches a phone flat on the desk, which head tracking alone
+     reads as a candidate facing the screen throughout. It is rated
+     above looking_away because it is harder to do by accident. */
+  gaze_off_screen:    { severity: 'high',     label: 'Eyes directed off screen' },
+  /* Not an accusation in itself — the candidate is asked to remove
+     the lenses and may simply have forgotten they had them on. It
+     becomes serious if it persists after they have been told. */
+  eyes_obscured:      { severity: 'medium',   label: 'Eyes not visible — tinted or dark lenses' },
+  /* The candidate's browser sent gaze limits outside the plausible
+     range and the server brought them back. Carries zero weight: a
+     poor camera can cause it, so it is shown to the invigilator
+     rather than counted against the candidate. */
+  calibration_out_of_range: { severity: 'medium', label: 'Eye calibration outside the plausible range' },
+
+  /* ---- the candidate's screen ----
+     A browser cannot compel screen sharing: it can ask, check what it
+     was given, and notice when it stops. Each of these is that
+     noticing. Refusing outright is rated highest because it is the
+     only one that cannot happen by accident. */
+  screen_share_refused: { severity: 'critical', label: 'Screen sharing refused' },
+  screen_share_stopped: { severity: 'critical', label: 'Screen sharing stopped mid-examination' },
+  /* Sharing one window rather than the whole screen leaves the rest
+     of the display unseen. Not necessarily deliberate — some browsers
+     offer no whole-screen option — so it is shown to the invigilator
+     rather than counted heavily against the candidate. */
+  screen_share_partial: { severity: 'medium',   label: 'Shared one window, not the whole screen' },
+
+  /* A second sign-in on the same credentials tried to answer a paper
+     already in progress. There is no innocent reading of this that
+     does not also mean the candidate's password is in someone else's
+     hands, so it is rated at the top either way. */
+  concurrent_session:  { severity: 'critical', label: 'Second sign-in on these credentials' },
+
+  /* ---- reported by the secure client ----
+     A browser cannot see any of these. They arrive only from the
+     desktop client, which is why a paper that cares about them has
+     to require it. */
+  blocked_process:     { severity: 'critical', label: 'Prohibited program running' },
+  blocked_request:     { severity: 'high',     label: 'Page reached for a host outside ExamProbe' },
   identity_mismatch:  { severity: 'critical', label: 'Candidate substitution suspected' },
   room_noise:         { severity: 'medium',   label: 'Room noise detected' },
   tab_switch:         { severity: 'high',     label: 'Tab or window switch' },

@@ -4,6 +4,7 @@ import cors from 'cors';
 import morgan from 'morgan';
 import cookieParser from 'cookie-parser';
 import rateLimit from 'express-rate-limit';
+import { startBus, busMode } from './realtime/bus.js';
 import jwt from 'jsonwebtoken';
 import mongoose from 'mongoose';
 
@@ -241,9 +242,17 @@ const start = async () => {
   await syncSystemRoles();
   await backfillExamInstants();
   await stampQcEnforcementStart();
+  /* Before anything is accepted, so the first push of the morning
+     already spans instances rather than the first few being lost to
+     whichever socket happened to land elsewhere. */
+  await startBus();
+
   const server = app.listen(env.port, () => {
     console.log(`[api] ExamProbe listening on http://localhost:${env.port}/api`);
     console.log(`[api] browser origins permitted: ${env.corsOrigins.join(', ')}`);
+    console.log(`[api] realtime delivery: ${busMode() === 'redis'
+      ? 'shared bus — safe to run several instances'
+      : 'single instance only — set REDIS_URL before scaling out'}`);
   });
   attachRealtime(server);
   startMailWorker();

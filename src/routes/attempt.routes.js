@@ -1,4 +1,4 @@
-import { Router } from 'express';
+import express, { Router } from 'express';
 import crypto from 'node:crypto';
 import { z } from 'zod';
 import QRCode from 'qrcode';
@@ -10,6 +10,7 @@ import { parse } from '../utils/validate.js';
 import {
   hasContent, SEVERITY_WEIGHT, VIOLATION_CATALOGUE,
 } from '../utils/grading.js';
+import { sanitiseCalibration, calibrationAcceptable, gazeCalibrationFor } from '../utils/gaze.js';
 import { storage, evidenceKey, decodeDataUrl, validateUpload } from '../services/storage.js';
 import { pushToWatchers } from '../realtime/live.js';
 import { formatInZone } from '../utils/time.js';
@@ -40,7 +41,7 @@ async function loadAttempt(req, { requireActive = false } = {}) {
     _id: req.params.id,
     studentId: req.actor.id,
     ...tenant(req),
-  });
+  }).select('+sessionId');
   if (!attempt) throw notFound('Examination not found');
 
   const exam = await Exam.findById(attempt.examId);
@@ -50,6 +51,37 @@ async function loadAttempt(req, { requireActive = false } = {}) {
     if (attempt.status === 'submitted') throw forbidden('You have already submitted this paper');
     if (attempt.status === 'terminated') throw forbidden('This attempt was ended by the invigilator');
     if (attempt.status !== 'in_progress') throw forbidden('This examination has not started');
+
+    /* ONE SIGN-IN PER PAPER IN PROGRESS.
+
+       The attempt was pinned to a session when the paper opened. A
+       request bearing a different one is a second sign-in on the same
+       credentials — the accomplice sitting elsewhere, answering the
+       questions the candidate found hard.
+
+       The newcomer is refused rather than the original: whoever is
+       already answering keeps the paper, and the intruder is the one
+       turned away. Refusing both would hand any candidate a way to
+       end a rival's examination by signing in as them. */
+    if (attempt.sessionId && req.actor.sessionId && attempt.sessionId !== req.actor.sessionId) {
+      const already = (attempt.violations || []).some((v) => v.type === 'concurrent_session');
+      if (!already) {
+        attempt.violations.push({
+          type: 'concurrent_session',
+          severity: VIOLATION_CATALOGUE.concurrent_session.severity,
+          weight: SEVERITY_WEIGHT[VIOLATION_CATALOGUE.concurrent_session.severity] ?? 3,
+          at: now(),
+          note: 'A second sign-in on these credentials tried to answer this paper.',
+        });
+        attempt.flagScore = (attempt.flagScore || 0)
+          + (SEVERITY_WEIGHT[VIOLATION_CATALOGUE.concurrent_session.severity] ?? 3);
+        await attempt.save();
+      }
+      throw forbidden(
+        'This examination is already open in another session. '
+        + 'If that was not you, tell your invigilator immediately.',
+      );
+    }
 
     // The timer is authoritative on the server. A client with a
     // frozen clock cannot buy itself extra time.
@@ -214,6 +246,22 @@ const joinSchema = z.object({
   displays: z.number().int().optional(),
   virtualMachine: z.boolean().optional(),
   bandwidthMbps: z.number().optional(),
+  /* Sent by the ExamProbe Secure Client, absent in a browser.
+
+     A HONEST NOTE ON WHAT THIS PROVES: nothing, on its own. Anything
+     can set a field in a request body, and a candidate with the
+     client binary can read whatever secret we might bake into it.
+     This stops a candidate opening the examination in Chrome because
+     it is easier; it does not stop one who is determined to forge it.
+
+     The control that actually holds is the sitting: candidates on
+     managed campus machines, where they are not administrators and
+     the client is installed by policy. The field records which route
+     a candidate came in by, so an invigilator can see it. */
+  secureClient: z.object({
+    version: z.string().max(32),
+    platform: z.string().max(32),
+  }).optional(),
   location: z.object({ lat: z.number(), lng: z.number() }).nullable().optional(),
 });
 
@@ -229,6 +277,14 @@ r.post('/:id/join', wrap(async (req, res) => {
     ? exam.proctoring.allowedPlatforms
     : ['windows'];
 
+  /* A paper that requires the client will not open in a browser. */
+  if (exam.proctoring?.requireSecureClient && !body.secureClient) {
+    throw forbidden(
+      'This examination must be taken in the ExamProbe Secure Client, not in a web browser. '
+      + 'Open the ExamProbe application and sign in there.',
+    );
+  }
+
   const platform = body.platform.toLowerCase();
   const permitted = allowed.some((p) => platform.includes(p.toLowerCase()));
 
@@ -238,6 +294,9 @@ r.post('/:id/join', wrap(async (req, res) => {
     screen: body.screen,
     displays: body.displays,
     virtualMachine: body.virtualMachine,
+    secureClient: body.secureClient
+      ? `${body.secureClient.version} (${body.secureClient.platform})`
+      : null,
     ip: req.ip,
     location: body.location || undefined,
   };
@@ -289,6 +348,8 @@ r.post('/:id/join', wrap(async (req, res) => {
         faceTracking: exam.proctoring.faceTracking,
         audioMonitoring: exam.proctoring.audioMonitoring,
         browserLock: exam.proctoring.browserLock,
+        screenCapture: exam.proctoring.screenCapture !== false,
+        flagClips: exam.proctoring.flagClips !== false,
         mobileScan: exam.proctoring.mobileScan,
         freehandCanvas: exam.proctoring.freehandCanvas,
         captureIntervalSeconds: exam.proctoring.captureIntervalSeconds,
@@ -352,6 +413,86 @@ r.post('/:id/identity', wrap(async (req, res) => {
 }));
 
 /* ============================================================
+   GAZE CALIBRATION — where this candidate's eyes sit on their screen
+
+   Recorded before the paper opens, by asking the candidate to look
+   at five marked points.
+
+   Two things are refused here, and both are refusals of the
+   candidate rather than of a mistake.
+
+   The first is a calibration that arrives once the paper is open. A
+   candidate who can recalibrate mid-examination simply points their
+   eyes at the phone on the desk, calls that the centre of the
+   screen, and the check now certifies exactly the behaviour it
+   exists to catch. Calibration belongs to the period before the
+   paper is released and nowhere else.
+
+   The second is a calibration whose numbers are not plausible. See
+   utils/gaze.js — the limits are clamped rather than rejected, so a
+   hostile client gets the defaults instead of an error it could
+   learn from, and the attempt records that its browser sent values
+   out of range.
+   ============================================================ */
+r.post('/:id/gaze-calibration', wrap(async (req, res) => {
+  const { attempt } = await loadAttempt(req);
+
+  if (!['not_started', 'verifying'].includes(attempt.status)) {
+    throw forbidden('Eye calibration can only be done before the paper opens.');
+  }
+
+  const body = parse(z.object({
+    centreH: z.number().optional(),
+    centreV: z.number().optional(),
+    h: z.number().optional(),
+    down: z.number().optional(),
+    up: z.number().optional(),
+    points: z.number().optional(),
+    /* The candidate's browser saying it could not do this at all —
+       an older model with no iris landmarks, or a camera too poor to
+       hold a reading. Recorded rather than silently absent. */
+    unavailable: z.enum(['no_iris', 'failed', 'skipped']).optional(),
+  }), req.body);
+
+  if (body.unavailable) {
+    attempt.gazeCalibration = { unavailable: body.unavailable, at: now() };
+    await attempt.save();
+    return res.json({ ok: true, calibrated: false, reason: body.unavailable });
+  }
+
+  if (!calibrationAcceptable(body.points)) {
+    attempt.gazeCalibration = { unavailable: 'failed', at: now() };
+    await attempt.save();
+    return res.json({
+      ok: true, calibrated: false, reason: 'failed',
+      message: 'Not enough usable readings. The examination will use the standard limits.',
+    });
+  }
+
+  const { calibration, clamped } = sanitiseCalibration(body);
+  attempt.gazeCalibration = { ...calibration, at: now() };
+  await attempt.save();
+
+  if (clamped) {
+    /* Not an accusation — a poor camera in bad light can produce wild
+       readings too — but the invigilator should see it, because every
+       honest explanation for it is also worth looking into. Weight
+       zero: it is recorded, and it does not on its own push anybody
+       over the termination ceiling. */
+    attempt.violations.push({
+      type: 'calibration_out_of_range',
+      severity: VIOLATION_CATALOGUE.calibration_out_of_range.severity,
+      weight: 0,
+      at: now(),
+      note: 'Calibration sent by the candidate\'s browser was outside the plausible range and was limited.',
+    });
+    await attempt.save();
+  }
+
+  res.json({ ok: true, calibrated: true, limited: clamped, points: calibration.points });
+}));
+
+/* ============================================================
    START — releases the paper and fixes the timer
    ============================================================ */
 r.post('/:id/start', wrap(async (req, res) => {
@@ -401,6 +542,9 @@ r.post('/:id/start', wrap(async (req, res) => {
     const personal = new Date(t.getTime() + sitting.durationMinutes * 60000);
 
     attempt.status = 'in_progress';
+  /* The paper is now pinned to this sign-in. Every write after this
+     has to come from the same one. */
+  attempt.sessionId = req.actor.sessionId || null;
     attempt.startedAt = t;
     attempt.timerEndsAt = personal < roomClose ? personal : roomClose;
     attempt.sectionState = { current: 'A', lockedSections: [], gatePassedAt: undefined };
@@ -447,6 +591,12 @@ r.post('/:id/start', wrap(async (req, res) => {
          whatever the screen does. */
       lockedQuestionIds: (attempt.lockedQuestionIds || []).map(String),
       resumed: (attempt.resumes || []).length > 0,
+      /* The limits taken before the paper opened, sent back so the
+         examination applies this candidate's own range rather than
+         the defaults. Null where calibration did not happen, in
+         which case the screen falls back to the wider defaults —
+         which is the forgiving direction to fail in. */
+      gazeCalibration: gazeCalibrationFor(attempt),
       answers: attempt.answers.map((a) => ({
         questionId: String(a.questionId),
         /* Cleaned on the way back out as well, because this is set
@@ -496,7 +646,12 @@ r.patch('/:id/answers/:questionId', wrap(async (req, res) => {
   }
 
   const body = parse(z.object({
-    selected: z.array(z.string()).optional(),
+/* An answer selects from the options printed on the paper. A dozen is
+       already generous; a request carrying a million is not a candidate
+       answering a question, and validating it is how a process runs out
+       of memory. Every array reachable without a staff login is bounded
+       for the same reason. */
+    selected: z.array(z.string().max(64)).max(50).optional(),
     text: z.string().max(20000).optional(),
     html: z.string().max(200000).optional(),
     mode: z.enum(['typed', 'scanned', 'mixed']).optional(),
@@ -616,7 +771,7 @@ r.post('/:id/violations', wrap(async (req, res) => {
     keys[field === 'cameraFrame' ? 'cameraKey' : 'screenKey'] = key;
   }
 
-  attempt.violations.push({
+  const recorded = attempt.violations.create({
     type: body.type,
     severity: spec.severity,
     weight,
@@ -624,6 +779,7 @@ r.post('/:id/violations', wrap(async (req, res) => {
     note: body.note,
     ...keys,
   });
+  attempt.violations.push(recorded);
   attempt.flagScore = (attempt.flagScore || 0) + weight;
 
   const ceiling = exam.proctoring?.flagCeiling ?? 3;
@@ -647,6 +803,9 @@ r.post('/:id/violations', wrap(async (req, res) => {
 
   res.json({
     ok: true,
+    /* The browser needs this to post the clip once the seconds after
+       the flag have actually happened. */
+    violationId: String(recorded._id),
     label: spec.label,
     severity: spec.severity,
     flagScore: attempt.flagScore,
@@ -656,6 +815,56 @@ r.post('/:id/violations', wrap(async (req, res) => {
     enforcing,
   });
 }));
+
+/* ============================================================
+   THE CLIP FOR A FLAGGED MOMENT
+
+   Arrives up to half a minute after the flag itself, because the
+   seconds following the moment have to happen before they can be
+   recorded. It is posted as raw video rather than a base64 data URL:
+   a thirty-second clip is megabytes, and base64 adds a third again
+   to something already near the request limit.
+
+   A clip is accepted for a terminated attempt as well as a live one.
+   An attempt ended ON a violation is precisely the one whose last
+   thirty seconds somebody is going to want to watch, and refusing it
+   would throw away the evidence for the decision.
+   ============================================================ */
+r.post('/:id/violations/:violationId/clip',
+  express.raw({ type: 'video/webm', limit: '10mb' }),
+  wrap(async (req, res) => {
+    const { attempt } = await loadAttempt(req);
+
+    const violation = attempt.violations.id(req.params.violationId);
+    if (!violation) throw notFound('That flagged moment could not be found');
+
+    const which = req.query.of === 'screen' ? 'screenClipKey' : 'clipKey';
+    if (violation[which]) {
+      /* Already held. A retry after a timeout must not quietly
+         replace evidence that already arrived. */
+      return res.json({ ok: true, stored: false, reason: 'already_held' });
+    }
+
+    const buffer = Buffer.isBuffer(req.body) ? req.body : null;
+    if (!buffer || !buffer.length) throw badRequest('No video was received');
+
+    const err = validateUpload('clip', 'video/webm', buffer.length);
+    if (err) throw badRequest(err);
+
+    const key = evidenceKey({
+      institutionId: req.actor.institutionId,
+      examId: attempt.examId,
+      attemptId: attempt._id,
+      kind: 'clip',
+      ext: 'webm',
+    });
+    await storage.put(key, buffer, 'video/webm');
+
+    violation[which] = key;
+    await attempt.save();
+
+    res.json({ ok: true, stored: true, bytes: buffer.length });
+  }));
 
 /* ============================================================
    INTERVAL EVIDENCE

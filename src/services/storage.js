@@ -36,6 +36,11 @@ const KIND_RULES = {
      examination machine — read this one rule. */
   scan:     { max: 20_000_000, types: ['application/pdf'] },
   audio:    { max: 2_000_000,  types: ['audio/webm', 'audio/ogg', 'audio/mpeg'] },
+  /* Thirty seconds either side of a flag, from the camera or the
+     screen. Eight megabytes is generous for that at the bitrates the
+     browser is asked for; a clip arriving larger means the recorder
+     ignored them, and is refused rather than stored. */
+  clip:     { max: 8_000_000,  types: ['video/webm'] },
 };
 
 export function validateUpload(kind, mime, bytes) {

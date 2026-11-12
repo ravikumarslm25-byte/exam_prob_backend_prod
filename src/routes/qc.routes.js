@@ -125,7 +125,8 @@ r.patch('/run/:token/answer/:questionId', wrap(async (req, res) => {
   }
 
   const body = parse(z.object({
-    selected: z.array(z.string()).optional(),
+    /* Unauthenticated: reached with a token alone, so bounded. */
+    selected: z.array(z.string().max(64)).max(50).optional(),
     text: z.string().max(20000).optional(),
     html: z.string().max(200000).optional(),
   }), req.body);

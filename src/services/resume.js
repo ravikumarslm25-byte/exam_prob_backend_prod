@@ -197,6 +197,11 @@ export async function applyResume({ attempt, exam, approver, reason, extraMinute
     attempt.timerEndsAt = new Date(from.getTime() + extraMinutes * 60_000);
   }
   attempt.status = 'in_progress';
+  /* Unpinned, so the candidate can sign in afresh on whatever machine
+     they have been moved to. A readmission is the one case where a
+     new session is legitimate, and it has already been approved by an
+     invigilator — which is the control here, rather than the pin. */
+  attempt.sessionId = null;
 
   attempt.resumes = [...(attempt.resumes || []), {
     at: new Date(),

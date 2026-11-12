@@ -66,6 +66,9 @@ export async function authenticate(req, _res, next) {
       if (!student || student.status !== 'active') throw unauthorized();
       req.actor = {
         kind: 'student',
+        /* Which sign-in this is, as opposed to which candidate. An
+           examination in progress is pinned to one of these. */
+        sessionId: claims.sid || null,
         id: String(student._id),
         institutionId: String(student.institutionId),
         name: student.name,

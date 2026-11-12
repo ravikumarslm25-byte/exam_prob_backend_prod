@@ -70,6 +70,20 @@ const examSchema = new Schema({
     idVerification: { type: Boolean, default: true },
     audioMonitoring:{ type: Boolean, default: true },
     browserLock:    { type: Boolean, default: true },
+    /* Capture the candidate's screen alongside the camera at every
+       flagged moment. Off for papers where the screen holds nothing
+       worth seeing, and for candidates on a browser that cannot. */
+    screenCapture:  { type: Boolean, default: true },
+    /* Thirty seconds of video around each flagged moment. The single
+       largest contributor to storage, so it is a per-paper choice:
+       worth it for an end-semester paper, arguable for a short
+       internal test with four hundred candidates. */
+    flagClips:      { type: Boolean, default: true },
+    /* The paper may only be sat inside the ExamProbe Secure Client,
+       not in a browser. Off by default: it needs the client installed
+       on every machine, which is a decision about the sitting rather
+       than about the paper. */
+    requireSecureClient: { type: Boolean, default: false },
     mobileScan:     { type: Boolean, default: true },
     freehandCanvas: { type: Boolean, default: false },
     allowedPlatforms:       { type: [String], default: ['windows'] },
@@ -287,6 +301,18 @@ const answerSchema = new Schema({
   countedInBestN: { type: Boolean, default: true },
 }, { _id: false });
 
+/* Violations carry an _id, which subdocuments do not by default.
+
+   A clip cannot be uploaded in the same request that raises the
+   flag: the fifteen seconds AFTER the moment have not happened yet,
+   so the browser reports the violation immediately and sends the
+   video half a minute later. Something has to say which flag the
+   video belongs to, and an array index is not that — by the time the
+   clip arrives, three more flags may have been pushed in front of
+   it.
+
+   Turning ids on is additive. Violations recorded before this have
+   none, which is correct: they have no clips either. */
 const violationSchema = new Schema({
   type: { type: String, required: true },
   severity: { type: String, enum: ['info', 'medium', 'high', 'critical'], default: 'medium' },
@@ -295,8 +321,13 @@ const violationSchema = new Schema({
   screenKey: String,
   cameraKey: String,
   audioKey: String,
+  /* The thirty seconds around the moment: the candidate, and what
+     was on their screen. Either may be absent — the browser may not
+     be able to record, and the paper may not ask for the screen. */
+  clipKey: String,
+  screenClipKey: String,
   note: String,
-}, { _id: false });
+});
 
 const attemptSchema = new Schema({
   institutionId: ref('Institution', { required: true }),
@@ -310,6 +341,22 @@ const attemptSchema = new Schema({
     enum: ['not_started', 'verifying', 'in_progress', 'submitted', 'flagged', 'terminated', 'absent'],
     default: 'not_started', index: true,
   },
+
+  /* ----------------------------------------------------------
+     WHICH SIGN-IN IS SITTING THIS PAPER
+
+     Recorded when the paper is released and checked on every write
+     after it. Without this, a candidate can hand their register
+     number and password to somebody else and both can answer the
+     same paper at once: the second sign-in invalidates the first's
+     refresh token, but its access token stays valid for its full
+     life, and nothing anywhere notices.
+
+     Cleared when an invigilator readmits a candidate, because a
+     genuine reconnection is exactly the case that needs a new
+     session — and it goes through a person either way.
+     ---------------------------------------------------------- */
+  sessionId: { type: String, select: false },
 
   joinedAt: Date,
   startedAt: Date,
@@ -328,6 +375,34 @@ const attemptSchema = new Schema({
     platform: String, browser: String, screen: String,
     ip: String, location: { lat: Number, lng: Number },
     displays: Number, virtualMachine: Boolean,
+    /* Which route the candidate came in by: the secure client's
+       version, or null for a browser. */
+    secureClient: String,
+  },
+
+  /* ----------------------------------------------------------
+     WHERE THIS CANDIDATE'S EYES SIT WHEN THEY LOOK AT THE SCREEN
+
+     Taken before the paper opens, by asking them to look at five
+     marked points. A candidate close to a large monitor sweeps a far
+     wider gaze range than one leaning back from a laptop, so a single
+     fixed threshold is either too tight for the first or useless
+     against the second.
+
+     `unavailable` is the honest alternative to an empty object: a
+     reviewer must be able to tell "the eyes were watched and stayed
+     on the screen" from "the eyes were never watched at all", and an
+     absent calibration on its own does not say which.
+     ---------------------------------------------------------- */
+  gazeCalibration: {
+    centreH: Number,
+    centreV: Number,
+    h: Number,
+    down: Number,
+    up: Number,
+    points: Number,
+    at: Date,
+    unavailable: { type: String, enum: ['no_iris', 'failed', 'skipped'] },
   },
 
   sectionState: {

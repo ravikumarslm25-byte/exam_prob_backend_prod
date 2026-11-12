@@ -256,8 +256,14 @@ r.get('/attempts/:id', can('invigilation:view'), wrap(async (req, res) => {
       type: v.type,
       label: VIOLATION_CATALOGUE[v.type]?.label || v.type,
       severity: v.severity, weight: v.weight, at: v.at, note: v.note,
+      id: v._id ? String(v._id) : null,
       cameraUrl: await url(v.cameraKey),
       screenUrl: await url(v.screenKey),
+      /* The thirty seconds around the moment. Absent on anything
+         recorded before clips existed, and on a browser that cannot
+         record — the panel shows the stills in that case. */
+      clipUrl: await url(v.clipKey),
+      screenClipUrl: await url(v.screenClipKey),
     }))),
     chat: (attempt.chat || []).map((c) => ({ from: c.from, body: c.body, at: c.at })),
     warnings: (attempt.warnings || []).map((w) => ({

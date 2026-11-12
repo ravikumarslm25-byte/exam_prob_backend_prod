@@ -1,6 +1,7 @@
 import { WebSocketServer } from 'ws';
 import jwt from 'jsonwebtoken';
 import { env } from '../config/env.js';
+import { publish, subscribe, CHANNELS } from './bus.js';
 import { Attempt, Room } from '../models/exam.js';
 import { User, Student } from '../models/core.js';
 
@@ -592,7 +593,18 @@ export function attachRealtime(server) {
    through REST so they are audited, but the candidate should feel
    them immediately rather than on the next heartbeat.
    ============================================================ */
-export function pushToCandidate(attemptId, payload) {
+/* ------------------------------------------------------------
+   DELIVERY, LOCAL AND ACROSS INSTANCES
+
+   Each push does two things: delivers to the sockets THIS process
+   holds, and publishes so every other instance does the same with
+   the sockets it holds. A socket cannot be shared between processes;
+   the instruction to deliver can.
+
+   On a single instance the publish is a no-op and the behaviour is
+   exactly what it was.
+   ------------------------------------------------------------ */
+function deliverToCandidate(attemptId, payload) {
   const entry = candidates.get(String(attemptId));
   if (!entry) return false;
   /* The real answer, not "there was an entry". A socket mid-close
@@ -601,7 +613,7 @@ export function pushToCandidate(attemptId, payload) {
   return send(entry.socket, payload);
 }
 
-export function pushToWatchers(attemptId, payload) {
+function deliverToWatchers(attemptId, payload) {
   const entry = candidates.get(String(attemptId));
   if (!entry) return 0;
   const all = new Set([...roomWatchers(entry.roomId), ...entry.focusWatchers]);
@@ -609,10 +621,38 @@ export function pushToWatchers(attemptId, payload) {
   return all.size;
 }
 
-export function pushToRoom(roomId, payload) {
+function deliverToRoom(roomId, payload) {
   const set = monitors.get(String(roomId)) || new Set();
   for (const s of set) send(s, payload);
   return set.size;
+}
+
+/* The other instances' half. Subscribed once at startup. */
+subscribe(CHANNELS.candidate, (m) => deliverToCandidate(m.attemptId, m.payload));
+subscribe(CHANNELS.watchers, (m) => deliverToWatchers(m.attemptId, m.payload));
+subscribe(CHANNELS.room, (m) => deliverToRoom(m.roomId, m.payload));
+
+export function pushToCandidate(attemptId, payload) {
+  const delivered = deliverToCandidate(attemptId, payload);
+  publish(CHANNELS.candidate, { attemptId: String(attemptId), payload });
+  return delivered;
+}
+
+export function pushToWatchers(attemptId, payload) {
+  const delivered = deliverToWatchers(attemptId, payload);
+  /* Published even when this instance found watchers: a candidate's
+     invigilators are not necessarily all on one instance, and
+     stopping at the first match would reach some of them and not
+     others — the worst of the three possible outcomes, because it
+     looks like it worked. */
+  publish(CHANNELS.watchers, { attemptId: String(attemptId), payload });
+  return delivered;
+}
+
+export function pushToRoom(roomId, payload) {
+  const delivered = deliverToRoom(roomId, payload);
+  publish(CHANNELS.room, { roomId: String(roomId), payload });
+  return delivered;
 }
 
 export const liveStats = () => ({
