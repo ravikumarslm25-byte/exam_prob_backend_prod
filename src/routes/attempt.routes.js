@@ -258,10 +258,14 @@ const joinSchema = z.object({
      managed campus machines, where they are not administrators and
      the client is installed by policy. The field records which route
      a candidate came in by, so an invigilator can see it. */
+  /* `.nullish()`, not `.optional()`. A browser has no secure client
+     and the page sends null for it; `.optional()` permits only an
+     ABSENT key, so null failed validation and every browser join was
+     refused with a 400 that said nothing useful about why. */
   secureClient: z.object({
     version: z.string().max(32),
     platform: z.string().max(32),
-  }).optional(),
+  }).nullish(),
   location: z.object({ lat: z.number(), lng: z.number() }).nullable().optional(),
 });
 

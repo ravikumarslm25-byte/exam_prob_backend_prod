@@ -84,3 +84,54 @@ test('the attempt schema holds a session id, and does not hand it out', async ()
      a paper and has no business in an ordinary read. */
   assert.equal(path.options.select, false);
 });
+
+/* ============================================================
+   THE JOIN PAYLOAD FROM A BROWSER
+
+   Build 21 added a `secureClient` field that the desktop client
+   fills and a browser does not. The schema accepted an ABSENT key
+   but not a null one, and the page sent null — so every join from a
+   browser was refused with a 400 whose message said only "some
+   fields are not valid".
+
+   It got through because the desktop client is the path that was
+   reasoned about, and the browser path was the one nobody re-ran.
+   ============================================================ */
+
+test('a browser join, which carries no secure client, is accepted', async () => {
+  const { z } = await import('zod');
+  const schema = z.object({
+    platform: z.string().min(1),
+    secureClient: z.object({
+      version: z.string().max(32),
+      platform: z.string().max(32),
+    }).nullish(),
+  });
+
+  /* All three shapes a client might send. */
+  assert.equal(schema.safeParse({ platform: 'macOS' }).success, true, 'key absent');
+  assert.equal(schema.safeParse({ platform: 'macOS', secureClient: null }).success, true, 'key null');
+  assert.equal(schema.safeParse({ platform: 'macOS', secureClient: undefined }).success, true, 'key undefined');
+});
+
+test('a join from the secure client still validates', async () => {
+  const { z } = await import('zod');
+  const schema = z.object({
+    secureClient: z.object({
+      version: z.string().max(32),
+      platform: z.string().max(32),
+    }).nullish(),
+  });
+  assert.equal(schema.safeParse({ secureClient: { version: '0.1.0', platform: 'win32' } }).success, true);
+});
+
+test('the route schema itself accepts a null secure client', async () => {
+  /* Reads the real file rather than a copy of the shape, so this
+     fails if someone changes .nullish() back to .optional(). */
+  const { readFile } = await import('node:fs/promises');
+  const src = await readFile(new URL('../routes/attempt.routes.js', import.meta.url), 'utf8');
+  const block = src.slice(src.indexOf('secureClient: z.object('));
+  const decl = block.slice(0, block.indexOf('\n  ', block.indexOf('}).')));
+  assert.ok(/\}\)\.nullish\(\)/.test(decl),
+    'secureClient must be .nullish() — .optional() alone rejects the null a browser sends');
+});
